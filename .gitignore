@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+.vscode/settings.json
+.python-version
+
+# assigment
+*.log
+/reports

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import logging
 import os
 import re
@@ -13,10 +14,14 @@ from typing import Any
 import httpx
 import pandas as pd
 from dotenv import load_dotenv
+from openpyxl.styles import Font, PatternFill
+from openpyxl.utils import get_column_letter
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 INPUT_FILE = PROJECT_ROOT / "data" / "cityInputs.txt"
 LOG_FILE = PROJECT_ROOT / "reports" / "pipeline.log"
+EXCEL_REPORT_FILE = PROJECT_ROOT / "reports" / "daily_weather_report.xlsx"
+ALERT_REPORT_FILE = PROJECT_ROOT / "reports" / "heat_alerts.json"
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 
 CITY_ALIASES = {
@@ -409,12 +414,132 @@ def transform_weather_data(
     return merged_statistics
 
 
+def get_report_threshold(logger: logging.Logger) -> float:
+    """Read and validate the Celsius heat-alert threshold from .env."""
+    configured_threshold = os.getenv("REPORT_THRESHOLD_C", "30")
+
+    try:
+        threshold = float(configured_threshold)
+    except ValueError:
+        logger.warning(
+            "Invalid REPORT_THRESHOLD_C value %r; using 30.0",
+            configured_threshold,
+        )
+        return 30.0
+
+    logger.info("Using %.1f°C heat-alert threshold", threshold)
+    return threshold
+
+
+def export_excel_report(
+    daily_statistics: pd.DataFrame,
+    output_file: Path,
+    logger: logging.Logger,
+) -> None:
+    """Export daily weather statistics to a formatted Excel workbook."""
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
+        daily_statistics.to_excel(
+            writer,
+            sheet_name="Daily Weather",
+            index=False,
+        )
+
+        worksheet = writer.sheets["Daily Weather"]
+        worksheet.freeze_panes = "A2"
+        worksheet.auto_filter.ref = worksheet.dimensions
+
+        header_fill = PatternFill("solid", fgColor="1F4E78")
+        for cell in worksheet[1]:
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = header_fill
+
+        column_indexes = {cell.value: cell.column for cell in worksheet[1]}
+        if "date" in column_indexes:
+            for cell in worksheet[get_column_letter(column_indexes["date"])][1:]:
+                cell.number_format = "yyyy-mm-dd"
+
+        for column_name in ("max_temperature_c", "total_precipitation_mm"):
+            if column_name in column_indexes:
+                column_letter = get_column_letter(column_indexes[column_name])
+                for cell in worksheet[column_letter][1:]:
+                    cell.number_format = "0.00"
+
+        for column_cells in worksheet.columns:
+            column_letter = get_column_letter(column_cells[0].column)
+            max_width = max(
+                len(str(cell.value)) if cell.value is not None else 0
+                for cell in column_cells
+            )
+            worksheet.column_dimensions[column_letter].width = min(
+                max_width + 2,
+                30,
+            )
+
+    logger.info(
+        "Exported %d rows to Excel report: %s",
+        len(daily_statistics),
+        output_file,
+    )
+
+
+def export_heat_alerts(
+    daily_statistics: pd.DataFrame,
+    threshold: float,
+    output_file: Path,
+    logger: logging.Logger,
+) -> None:
+    """Write a simplified JSON payload for cities above the heat threshold."""
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    alert_cities = sorted(
+        daily_statistics.loc[
+            daily_statistics["max_temperature_c"] > threshold,
+            "city",
+        ]
+        .dropna()
+        .unique()
+        .tolist()
+    )
+    payload = {
+        "report_threshold_c": threshold,
+        "cities": alert_cities,
+    }
+
+    output_file.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    logger.info(
+        "Exported %d heat-alert cities to JSON report: %s",
+        len(alert_cities),
+        output_file,
+    )
+
+
+def generate_reports(
+    daily_statistics: pd.DataFrame,
+    logger: logging.Logger,
+) -> None:
+    """Create the Excel report and heat-alert JSON payload."""
+    threshold = get_report_threshold(logger)
+    export_excel_report(daily_statistics, EXCEL_REPORT_FILE, logger)
+    export_heat_alerts(
+        daily_statistics,
+        threshold,
+        ALERT_REPORT_FILE,
+        logger,
+    )
+
+
 def main() -> None:
-    """Run the parsing, API extraction, and daily aggregation pipeline."""
+    """Run the parsing, extraction, transformation, and reporting pipeline."""
     logger = configure_logger()
     cities = parse_city_data(INPUT_FILE, logger)
     weather_records = extract_weather(cities, logger)
     daily_statistics = transform_weather_data(cities, weather_records, logger)
+    generate_reports(daily_statistics, logger)
 
     if daily_statistics.empty:
         print("No weather statistics were created.")

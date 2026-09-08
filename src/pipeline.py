@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import pandas as pd
 from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -68,9 +69,7 @@ def configure_logger() -> logging.Logger:
     if not logger.handlers:
         handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
         handler.setFormatter(
-            logging.Formatter(
-                "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-            )
+            logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
         )
         logger.addHandler(handler)
 
@@ -91,9 +90,7 @@ def ssl_verify_setting(logger: logging.Logger) -> bool | ssl.SSLContext:
     )
 
     if ca_bundle_value:
-        ca_bundle = Path(
-            os.path.expandvars(os.path.expanduser(ca_bundle_value))
-        )
+        ca_bundle = Path(os.path.expandvars(os.path.expanduser(ca_bundle_value)))
 
         if ca_bundle.is_file():
             try:
@@ -155,9 +152,7 @@ def parse_city_data(
             for line_number, row in enumerate(reader, start=1):
                 try:
                     if len(row) != 3:
-                        raise ValueError(
-                            f"Expected 3 CSV fields, received {len(row)}"
-                        )
+                        raise ValueError(f"Expected 3 CSV fields, received {len(row)}")
 
                     city = normalize_city_name(row[0])
                     latitude = float(row[1].strip())
@@ -214,7 +209,7 @@ def fetch_hourly_weather(
 
         weather_data = response.json()
         if not isinstance(weather_data, dict):
-            raise ValueError("API returned an unexpected response format")
+            raise TypeError("API returned an unexpected response format")
 
         logger.info("Retrieved weather data for %s", city.city)
         return WeatherRecord(
@@ -224,7 +219,7 @@ def fetch_hourly_weather(
             weather_data=weather_data,
         )
 
-    except (httpx.HTTPError, ValueError) as error:
+    except (httpx.HTTPError, TypeError, ValueError) as error:
         logger.error("Weather request failed for %s: %s", city.city, error)
         return None
 
@@ -264,16 +259,167 @@ def extract_weather(
     return results
 
 
+def weather_records_to_dataframe(
+    weather_records: list[WeatherRecord],
+    logger: logging.Logger,
+) -> pd.DataFrame:
+    """Load hourly weather JSON payloads into one normalized DataFrame."""
+    frames: list[pd.DataFrame] = []
+    required_columns = {"time", "temperature_2m", "precipitation"}
+
+    for record in weather_records:
+        hourly_data = record.weather_data.get("hourly")
+
+        if not isinstance(hourly_data, dict):
+            logger.error("Missing hourly data in API response for %s", record.city)
+            continue
+
+        missing_columns = required_columns.difference(hourly_data)
+        if missing_columns:
+            logger.error(
+                "Hourly API response for %s is missing columns: %s",
+                record.city,
+                ", ".join(sorted(missing_columns)),
+            )
+            continue
+
+        hourly_frame = pd.DataFrame(hourly_data)
+        hourly_frame["city"] = record.city
+        hourly_frame["latitude"] = record.latitude
+        hourly_frame["longitude"] = record.longitude
+
+        hourly_frame["timestamp"] = pd.to_datetime(
+            hourly_frame.pop("time"),
+            errors="coerce",
+        )
+        hourly_frame["temperature_2m"] = pd.to_numeric(
+            hourly_frame["temperature_2m"],
+            errors="coerce",
+        )
+        hourly_frame["precipitation"] = pd.to_numeric(
+            hourly_frame["precipitation"],
+            errors="coerce",
+        )
+
+        invalid_timestamp_count = hourly_frame["timestamp"].isna().sum()
+        missing_temperature_count = hourly_frame["temperature_2m"].isna().sum()
+        missing_precipitation_count = hourly_frame["precipitation"].isna().sum()
+
+        if invalid_timestamp_count:
+            logger.warning(
+                "Dropping %d rows with invalid timestamps for %s",
+                invalid_timestamp_count,
+                record.city,
+            )
+            hourly_frame = hourly_frame.dropna(subset=["timestamp"])
+
+        if missing_temperature_count or missing_precipitation_count:
+            logger.warning(
+                "Missing values for %s: temperature=%d, precipitation=%d",
+                record.city,
+                missing_temperature_count,
+                missing_precipitation_count,
+            )
+
+        frames.append(hourly_frame)
+
+    if not frames:
+        return pd.DataFrame(
+            columns=[
+                "city",
+                "latitude",
+                "longitude",
+                "timestamp",
+                "temperature_2m",
+                "precipitation",
+            ]
+        )
+
+    hourly_forecasts = pd.concat(frames, ignore_index=True)
+    logger.info("Loaded %d hourly forecast rows into pandas", len(hourly_forecasts))
+    return hourly_forecasts
+
+
+def aggregate_daily_weather(hourly_forecasts: pd.DataFrame) -> pd.DataFrame:
+    """Calculate daily maximum temperature and precipitation totals per city."""
+    if hourly_forecasts.empty:
+        return pd.DataFrame(
+            columns=[
+                "city",
+                "date",
+                "max_temperature_c",
+                "total_precipitation_mm",
+            ]
+        )
+
+    forecasts = hourly_forecasts.copy()
+    forecasts["date"] = forecasts["timestamp"].dt.normalize()
+
+    return (
+        forecasts.groupby(["city", "date"], as_index=False)
+        .agg(
+            max_temperature_c=("temperature_2m", "max"),
+            total_precipitation_mm=(
+                "precipitation",
+                lambda values: values.sum(min_count=1),
+            ),
+        )
+        .sort_values(["city", "date"], ignore_index=True)
+    )
+
+
+def merge_city_weather_statistics(
+    cities: list[CityRecord],
+    daily_weather: pd.DataFrame,
+) -> pd.DataFrame:
+    """Join normalized CSV city details to daily aggregated weather statistics."""
+    cities_frame = pd.DataFrame(
+        [
+            {
+                "city": city.city,
+                "latitude": city.latitude,
+                "longitude": city.longitude,
+            }
+            for city in cities
+        ]
+    )
+
+    return cities_frame.merge(
+        daily_weather,
+        on="city",
+        how="left",
+        validate="one_to_many",
+    ).sort_values(["city", "date"], ignore_index=True)
+
+
+def transform_weather_data(
+    cities: list[CityRecord],
+    weather_records: list[WeatherRecord],
+    logger: logging.Logger,
+) -> pd.DataFrame:
+    """Transform API responses, aggregate daily values, and join city metadata."""
+    hourly_forecasts = weather_records_to_dataframe(weather_records, logger)
+    daily_weather = aggregate_daily_weather(hourly_forecasts)
+    merged_statistics = merge_city_weather_statistics(cities, daily_weather)
+
+    logger.info(
+        "Created %d daily city weather-statistic rows",
+        len(merged_statistics),
+    )
+    return merged_statistics
+
+
 def main() -> None:
-    """Run the CSV parsing and sequential weather extraction pipeline."""
+    """Run the parsing, API extraction, and daily aggregation pipeline."""
     logger = configure_logger()
     cities = parse_city_data(INPUT_FILE, logger)
     weather_records = extract_weather(cities, logger)
+    daily_statistics = transform_weather_data(cities, weather_records, logger)
 
-    for record in weather_records:
-        hourly = record.weather_data.get("hourly", {})
-        record_count = len(hourly.get("time", []))
-        print(f"{record.city}: {record_count} hourly records retrieved")
+    if daily_statistics.empty:
+        print("No weather statistics were created.")
+    else:
+        print(daily_statistics.to_string(index=False))
 
 
 if __name__ == "__main__":

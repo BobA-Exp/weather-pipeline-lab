@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import csv
 import json
 import logging
@@ -229,28 +230,63 @@ def fetch_hourly_weather(
         return None
 
 
-def extract_weather(
+async def fetch_hourly_weather_async(
+    city: CityRecord,
+    client: httpx.AsyncClient,
+    logger: logging.Logger,
+) -> WeatherRecord | None:
+    """Request hourly temperature and precipitation for one city."""
+    params = {
+        "latitude": city.latitude,
+        "longitude": city.longitude,
+        "hourly": "temperature_2m,precipitation",
+        "timezone": "auto",
+    }
+
+    try:
+        logger.info("Requesting weather data for %s", city.city)
+
+        response = await client.get(OPEN_METEO_URL, params=params)
+        response.raise_for_status()
+
+        weather_data = response.json()
+        if not isinstance(weather_data, dict):
+            raise TypeError("API returned an unexpected response format")
+
+        logger.info("Retrieved weather data for %s", city.city)
+        return WeatherRecord(
+            city=city.city,
+            latitude=city.latitude,
+            longitude=city.longitude,
+            weather_data=weather_data,
+        )
+
+    except (httpx.HTTPError, TypeError, ValueError) as error:
+        logger.error("Weather request failed for %s: %s", city.city, error)
+        return None
+
+
+async def extract_weather(
     cities: list[CityRecord],
     logger: logging.Logger,
 ) -> list[WeatherRecord]:
-    """Sequentially retrieve weather data for each parsed city."""
-    results: list[WeatherRecord] = []
+    """Concurrently retrieve weather data for each parsed city."""
     start_time = time.perf_counter()
     verify = ssl_verify_setting(logger)
 
-    logger.info("Starting sequential API extraction for %d cities", len(cities))
+    logger.info("Starting concurrent API extraction for %d cities", len(cities))
+    results: list[WeatherRecord] = []
 
     try:
-        with httpx.Client(
+        async with httpx.AsyncClient(
             timeout=15.0,
             verify=verify,
             trust_env=True,
         ) as client:
-            for city in cities:
-                result = fetch_hourly_weather(city, client, logger)
-
-                if result is not None:
-                    results.append(result)
+            fetched = await asyncio.gather(
+                *(fetch_hourly_weather_async(city, client, logger) for city in cities)
+            )
+            results = [record for record in fetched if record is not None]
 
     finally:
         elapsed_seconds = time.perf_counter() - start_time
@@ -537,7 +573,7 @@ def main() -> None:
     """Run the parsing, extraction, transformation, and reporting pipeline."""
     logger = configure_logger()
     cities = parse_city_data(INPUT_FILE, logger)
-    weather_records = extract_weather(cities, logger)
+    weather_records = asyncio.run(extract_weather(cities, logger))
     daily_statistics = transform_weather_data(cities, weather_records, logger)
     generate_reports(daily_statistics, logger)
 
